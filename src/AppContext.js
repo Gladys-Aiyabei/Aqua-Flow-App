@@ -55,19 +55,37 @@ export function AppProvider({ children }) {
     await AsyncStorage.multiRemove([KEYS.session, KEYS.cache]);
   }, [apiUrl]);
 
+  const switchApiUrl = useCallback((url) => {
+    setApiUrlState(url);
+    AsyncStorage.setItem(KEYS.apiUrl, url).catch(() => {});
+  }, []);
+
   const refresh = useCallback(async () => {
     if (!sessionRef.current) return;
-    try {
-      const state = await api.get('/api/state');
+    const apply = (state) => {
       setData(state);
       setOnline(true);
       setLastSync(new Date());
       AsyncStorage.setItem(KEYS.cache, JSON.stringify(state)).catch(() => {});
+    };
+    try {
+      apply(await api.get('/api/state'));
     } catch (e) {
-      if (e.status === 401) signOut();
-      else setOnline(false);
+      if (e.status === 401) return signOut();
+      // The computer's Wi-Fi IP often changes between sessions; if the saved server address
+      // is unreachable, try the address of the machine currently serving the app.
+      const fallback = defaultApiUrl();
+      if (e.status === 0 && fallback !== apiUrl) {
+        try {
+          apply(await createApi(fallback, sessionRef.current.token).get('/api/state'));
+          switchApiUrl(fallback);
+          return undefined;
+        } catch { /* fall through to offline */ }
+      }
+      setOnline(false);
     }
-  }, [api, signOut]);
+    return undefined;
+  }, [api, apiUrl, signOut, switchApiUrl]);
 
   // Keep data live: refresh on sign-in, every few seconds, and when the app returns to the foreground.
   useEffect(() => {
@@ -84,8 +102,17 @@ export function AppProvider({ children }) {
   }, [session, refresh]);
 
   const signIn = useCallback(async (url, role, credentials) => {
-    const cleanUrl = url.trim().replace(/\/$/, '');
-    const res = await createApi(cleanUrl, null).post(`/api/auth/${role}`, credentials);
+    let cleanUrl = url.trim().replace(/\/$/, '');
+    let res;
+    try {
+      res = await createApi(cleanUrl, null).post(`/api/auth/${role}`, credentials);
+    } catch (e) {
+      // Saved address unreachable (e.g. the computer's IP changed): retry on the current dev machine.
+      const fallback = defaultApiUrl();
+      if (e.status !== 0 || fallback === cleanUrl) throw e;
+      res = await createApi(fallback, null).post(`/api/auth/${role}`, credentials);
+      cleanUrl = fallback;
+    }
     const sess = { token: res.token, role: res.role, name: res.name, phone: res.phone };
     await AsyncStorage.multiSet([[KEYS.apiUrl, cleanUrl], [KEYS.session, JSON.stringify(sess)]]);
     setApiUrlState(cleanUrl);
